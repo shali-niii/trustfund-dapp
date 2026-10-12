@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { ethers } from "ethers";
 import { Navbar } from "./components/Navbar";
 import { CampaignCard } from "./components/CampaignCard";
@@ -24,19 +24,30 @@ export default function App() {
   const [milestonesMap, setMilestonesMap] = useState({});
   const [userContributionsMap, setUserContributionsMap] = useState({});
   const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [activeFilter, setActiveFilter] = useState("all");
 
+  // Guards against overlapping fetches: only the most recent request may update state
+  const requestIdRef = useRef(0);
+  // Once campaigns have been shown, background refreshes must not swap the grid for the spinner
+  // (that unmounts every card and resets its expanded/input state)
+  const hasLoadedRef = useRef(false);
+
   // Fetch all campaigns and their data from blockchain
   const loadBlockchainData = useCallback(async () => {
+    const requestId = ++requestIdRef.current;
+    const isStale = () => requestId !== requestIdRef.current;
+
     if (!contract) {
       setIsLoading(false);
       return;
     }
 
     try {
-      setIsLoading(true);
+      if (!hasLoadedRef.current) setIsLoading(true);
+      setLoadError("");
       const totalCount = await contract.campaignCount();
       const count = Number(totalCount);
 
@@ -59,18 +70,32 @@ export default function App() {
         }
       }
 
+      if (isStale()) return; // a newer fetch started while this one was running
+      hasLoadedRef.current = true;
       setCampaigns(loadedCampaigns);
       setMilestonesMap(loadedMilestones);
       setUserContributionsMap(loadedContributions);
     } catch (err) {
       console.error("Error loading blockchain data:", err);
+      if (isStale()) return;
+      // BAD_DATA means "0x" came back: no contract at this address on the connected network
+      setLoadError(
+        err?.code === "BAD_DATA"
+          ? `No TrustFund contract found at ${contractAddress} on the connected network. Make sure your Hardhat node is running, the contract is deployed (npm run seed:local), and MetaMask is on the matching network.`
+          : `Could not load campaigns: ${err?.shortMessage || err?.message || "unknown error"}`
+      );
     } finally {
-      setIsLoading(false);
+      if (!isStale()) setIsLoading(false);
     }
-  }, [contract, account]);
+  }, [contract, account, contractAddress]);
 
   useEffect(() => {
     loadBlockchainData();
+    // When contract/account change (or on unmount) this invalidates the fetch that is still running
+    return () => {
+      // Generation counter (not a DOM ref): bump it so the superseded fetch is discarded
+      requestIdRef.current++;
+    };
   }, [loadBlockchainData]);
 
   // Global aggregate metrics
@@ -204,6 +229,13 @@ export default function App() {
           </div>
         </div>
 
+        {/* Load failure (wrong network / contract not deployed / RPC down) */}
+        {loadError && !isLoading && (
+          <div role="alert" className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs">
+            {loadError}
+          </div>
+        )}
+
         {/* Campaign Grid */}
         {isLoading ? (
           <div className="flex flex-col items-center justify-center py-20 gap-3 text-slate-400">
@@ -222,7 +254,7 @@ export default function App() {
               />
             ))}
           </div>
-        ) : (
+        ) : loadError ? null : (
           <div className="flex flex-col items-center justify-center py-16 px-4 rounded-2xl bg-slate-900/40 border border-slate-800/80 text-center">
             <div className="w-12 h-12 rounded-2xl bg-slate-800 flex items-center justify-center text-slate-400 mb-3">
               <FolderOpen className="w-6 h-6" />

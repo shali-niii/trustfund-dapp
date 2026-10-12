@@ -1,152 +1,108 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from "react";
+import React, { createContext, useContext, useState, useEffect, useMemo } from "react";
 import { ethers } from "ethers";
 import contractArtifact from "../contracts/TrustFundContract.json";
 
 const Web3Context = createContext();
 
-// Turns the different error shapes MetaMask / ethers can produce into a message a user can act on.
-// 4001 = user rejected the request, -32002 = a request is already waiting in the MetaMask popup.
-function describeWalletError(err, rejectedMessage, fallback) {
-  const codes = [err?.code, err?.error?.code, err?.info?.error?.code];
-  if (codes.includes(4001) || codes.includes("ACTION_REJECTED")) return rejectedMessage;
-  if (codes.includes(-32002)) {
-    return "A MetaMask request is already pending. Open the MetaMask extension to approve or reject it.";
-  }
-  return err?.shortMessage || err?.message || fallback;
-}
+const contractAddress = contractArtifact.address;
+const contractAbi = contractArtifact.abi;
 
 export function Web3Provider({ children }) {
   const [account, setAccount] = useState("");
   const [chainId, setChainId] = useState("");
-  const [provider, setProvider] = useState(null);
   const [signer, setSigner] = useState(null);
-  const [contract, setContract] = useState(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
 
-  // Refs hold values that async callbacks need but that must NOT trigger re-renders / effect re-runs.
-  const providerRef = useRef(null);
-  const accountRef = useRef(""); // lower-cased account currently reflected in state
-  const syncSeqRef = useRef(0); // lets a newer account update cancel an older in-flight one
-  const isConnectingRef = useRef(false); // blocks double-clicks before state has updated
+  // Created ONCE. A stable provider identity is what keeps every effect and
+  // callback downstream from re-firing on each render.
+  const provider = useMemo(() => {
+    if (typeof window !== "undefined" && window.ethereum) {
+      return new ethers.BrowserProvider(window.ethereum);
+    }
+    return null;
+  }, []);
 
-  const contractAddress = contractArtifact.address;
-  const contractAbi = contractArtifact.abi;
+  // Derived, not stored: only changes when the provider or signer really changes.
+  const contract = useMemo(() => {
+    if (!provider) return null;
+    return new ethers.Contract(contractAddress, contractAbi, signer ?? provider);
+  }, [provider, signer]);
 
-  // Single place that turns "the accounts MetaMask exposes" into account / signer / contract state.
-  // Used by initial load, the accountsChanged event and the Connect button.
-  const applyAccounts = useCallback(
-    async (browserProvider, accounts) => {
-      const next = accounts.length > 0 ? accounts[0].toLowerCase() : "";
-      if (next && next === accountRef.current) return; // already reflected, avoid a redundant refetch
-
-      const seq = ++syncSeqRef.current;
-
-      if (!next) {
-        // Disconnected: fall back to a read-only contract so campaigns stay visible
-        accountRef.current = "";
-        setAccount("");
-        setSigner(null);
-        setContract(new ethers.Contract(contractAddress, contractAbi, browserProvider));
-        return;
-      }
-
-      const activeSigner = await browserProvider.getSigner(accounts[0]);
-      if (seq !== syncSeqRef.current) return; // superseded by a newer update (or unmounted)
-
-      accountRef.current = next;
-      setAccount(accounts[0]);
-      setSigner(activeSigner);
-      setContract(new ethers.Contract(contractAddress, contractAbi, activeSigner));
-    },
-    [contractAddress, contractAbi]
-  );
-
-  // Set up the provider and wallet listeners ONCE (applyAccounts is stable, so this does not re-run).
-  // NOTE: this effect must never depend on `provider`/`contract`/`signer` state, because it sets them.
+  // One-time init + wallet event listeners
   useEffect(() => {
-    const ethereum = typeof window !== "undefined" ? window.ethereum : undefined;
-    if (!ethereum) return undefined;
-
+    if (!provider) return;
     let cancelled = false;
-    const browserProvider = new ethers.BrowserProvider(ethereum);
-    providerRef.current = browserProvider;
-    setProvider(browserProvider);
 
     (async () => {
       try {
-        const network = await browserProvider.getNetwork();
+        const network = await provider.getNetwork();
+        const accounts = await provider.send("eth_accounts", []);
         if (cancelled) return;
-        setChainId(network.chainId.toString());
 
-        // Check if user is already connected (does not open a MetaMask popup)
-        const accounts = await browserProvider.send("eth_accounts", []);
-        if (cancelled) return;
-        await applyAccounts(browserProvider, accounts);
+        setChainId(network.chainId.toString());
+        if (accounts.length > 0) {
+          const activeSigner = await provider.getSigner();
+          if (cancelled) return;
+          setAccount(accounts[0]);
+          setSigner(activeSigner);
+        }
       } catch (err) {
-        if (!cancelled) console.error("Error initializing Web3 provider:", err);
+        console.error("Error initializing Web3 provider:", err);
       }
     })();
 
-    const handleAccountsChanged = (accounts) => {
-      applyAccounts(browserProvider, accounts).catch((err) =>
-        console.error("Failed to handle account change:", err)
-      );
+    const handleAccountsChanged = async (accounts) => {
+      if (accounts.length > 0) {
+        try {
+          const activeSigner = await provider.getSigner();
+          setAccount(accounts[0]);
+          setSigner(activeSigner);
+        } catch (err) {
+          console.error("Error switching account:", err);
+        }
+      } else {
+        setAccount("");
+        setSigner(null);
+      }
     };
 
-    // MetaMask recommends a full reload when the network changes
     const handleChainChanged = () => {
       window.location.reload();
     };
 
-    ethereum.on("accountsChanged", handleAccountsChanged);
-    ethereum.on("chainChanged", handleChainChanged);
+    window.ethereum.on("accountsChanged", handleAccountsChanged);
+    window.ethereum.on("chainChanged", handleChainChanged);
 
     return () => {
       cancelled = true;
-      // Generation counter (not a DOM ref): bump it so any in-flight account update is discarded
-      syncSeqRef.current++;
-      ethereum.removeListener("accountsChanged", handleAccountsChanged);
-      ethereum.removeListener("chainChanged", handleChainChanged);
+      window.ethereum.removeListener("accountsChanged", handleAccountsChanged);
+      window.ethereum.removeListener("chainChanged", handleChainChanged);
     };
-  }, [applyAccounts]);
+  }, [provider]);
 
   // Connect MetaMask Wallet
   const connectWallet = async () => {
-    if (!window.ethereum) {
+    if (!provider) {
       setErrorMessage("MetaMask not found. Please install the MetaMask browser extension.");
       return;
     }
-    if (isConnectingRef.current) return; // a request is already open in MetaMask
-    isConnectingRef.current = true;
 
     try {
       setIsConnecting(true);
       setErrorMessage("");
 
-      const browserProvider = providerRef.current ?? new ethers.BrowserProvider(window.ethereum);
-      providerRef.current = browserProvider;
+      const accounts = await provider.send("eth_requestAccounts", []);
+      const activeSigner = await provider.getSigner();
+      const network = await provider.getNetwork();
 
-      const accounts = await browserProvider.send("eth_requestAccounts", []);
-      if (!accounts || accounts.length === 0) {
-        throw new Error("MetaMask did not return any accounts. Unlock MetaMask and try again.");
-      }
-      const network = await browserProvider.getNetwork();
-
-      await applyAccounts(browserProvider, accounts);
-      setProvider(browserProvider);
+      setAccount(accounts[0]);
+      setSigner(activeSigner);
       setChainId(network.chainId.toString());
     } catch (err) {
       console.error("MetaMask connection failed:", err);
-      setErrorMessage(
-        describeWalletError(
-          err,
-          "Connection request was rejected in MetaMask. Click \u201cConnect MetaMask\u201d to try again.",
-          "Failed to connect wallet."
-        )
-      );
+      setErrorMessage(err.message || "Failed to connect wallet.");
     } finally {
-      isConnectingRef.current = false;
       setIsConnecting(false);
     }
   };
@@ -154,7 +110,6 @@ export function Web3Provider({ children }) {
   // Switch network to Hardhat Localhost (31337)
   const switchToLocalhost = async () => {
     if (!window.ethereum) return;
-    setErrorMessage("");
     try {
       await window.ethereum.request({
         method: "wallet_switchEthereumChain",
@@ -162,27 +117,17 @@ export function Web3Provider({ children }) {
       });
     } catch (switchError) {
       if (switchError.code === 4902) {
-        try {
-          await window.ethereum.request({
-            method: "wallet_addEthereumChain",
-            params: [
-              {
-                chainId: "0x7a69",
-                chainName: "Hardhat Localhost",
-                nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-                rpcUrls: ["http://127.0.0.1:8545"],
-              },
-            ],
-          });
-        } catch (addError) {
-          setErrorMessage(
-            describeWalletError(addError, "Adding the Hardhat Localhost network was rejected.", "Failed to add network.")
-          );
-        }
-      } else {
-        setErrorMessage(
-          describeWalletError(switchError, "Network switch was rejected in MetaMask.", "Failed to switch network.")
-        );
+        await window.ethereum.request({
+          method: "wallet_addEthereumChain",
+          params: [
+            {
+              chainId: "0x7a69",
+              chainName: "Hardhat Localhost",
+              nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+              rpcUrls: ["http://127.0.0.1:8545"],
+            },
+          ],
+        });
       }
     }
   };

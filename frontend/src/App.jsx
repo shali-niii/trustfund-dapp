@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { ethers } from "ethers";
 import { Navbar } from "./components/Navbar";
 import { CampaignCard } from "./components/CampaignCard";
@@ -28,6 +28,10 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [activeFilter, setActiveFilter] = useState("all");
 
+  // Tracks whether we've shown data at least once, and which request is newest
+  const hasLoadedRef = useRef(false);
+  const requestIdRef = useRef(0);
+
   // Fetch all campaigns and their data from blockchain
   const loadBlockchainData = useCallback(async () => {
     if (!contract) {
@@ -35,37 +39,46 @@ export default function App() {
       return;
     }
 
-    try {
-      setIsLoading(true);
-      const totalCount = await contract.campaignCount();
-      const count = Number(totalCount);
+    const requestId = ++requestIdRef.current;
 
-      const loadedCampaigns = [];
+    try {
+      // Only show the full-page spinner on the very first load. Later refreshes
+      // (account change, after a transaction) update in place instead of
+      // blanking the grid, which is what looked like flickering.
+      if (!hasLoadedRef.current) setIsLoading(true);
+
+      const count = Number(await contract.campaignCount());
+
+      const rows = await Promise.all(
+        Array.from({ length: count }, async (_, idx) => {
+          const i = idx + 1;
+          const [c, mList, userContrib] = await Promise.all([
+            contract.campaigns(i),
+            contract.getMilestones(i),
+            account ? contract.contributions(i, account) : Promise.resolve(0n),
+          ]);
+          return { i, c, mList, userContrib };
+        })
+      );
+
+      // A newer request started while this one was in flight: drop stale results
+      if (requestId !== requestIdRef.current) return;
+
       const loadedMilestones = {};
       const loadedContributions = {};
-
-      for (let i = 1; i <= count; i++) {
-        const c = await contract.campaigns(i);
-        const mList = await contract.getMilestones(i);
-
-        loadedCampaigns.push(c);
+      rows.forEach(({ i, mList, userContrib }) => {
         loadedMilestones[i] = mList;
+        loadedContributions[i] = userContrib;
+      });
 
-        if (account) {
-          const userContrib = await contract.contributions(i, account);
-          loadedContributions[i] = userContrib;
-        } else {
-          loadedContributions[i] = 0n;
-        }
-      }
-
-      setCampaigns(loadedCampaigns);
+      setCampaigns(rows.map((r) => r.c));
       setMilestonesMap(loadedMilestones);
       setUserContributionsMap(loadedContributions);
+      hasLoadedRef.current = true;
     } catch (err) {
       console.error("Error loading blockchain data:", err);
     } finally {
-      setIsLoading(false);
+      if (requestId === requestIdRef.current) setIsLoading(false);
     }
   }, [contract, account]);
 

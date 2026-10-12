@@ -1,88 +1,89 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from "react";
+import React, { createContext, useContext, useState, useEffect, useMemo } from "react";
 import { ethers } from "ethers";
 import contractArtifact from "../contracts/TrustFundContract.json";
 
 const Web3Context = createContext();
 
+const contractAddress = contractArtifact.address;
+const contractAbi = contractArtifact.abi;
+
 export function Web3Provider({ children }) {
   const [account, setAccount] = useState("");
   const [chainId, setChainId] = useState("");
-  const [provider, setProvider] = useState(null);
   const [signer, setSigner] = useState(null);
-  const [contract, setContract] = useState(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
 
-  const contractAddress = contractArtifact.address;
-  const contractAbi = contractArtifact.abi;
-
-  // Initialize Web3 provider & read-only contract instance
-  const initProvider = useCallback(async () => {
+  // Created ONCE. A stable provider identity is what keeps every effect and
+  // callback downstream from re-firing on each render.
+  const provider = useMemo(() => {
     if (typeof window !== "undefined" && window.ethereum) {
+      return new ethers.BrowserProvider(window.ethereum);
+    }
+    return null;
+  }, []);
+
+  // Derived, not stored: only changes when the provider or signer really changes.
+  const contract = useMemo(() => {
+    if (!provider) return null;
+    return new ethers.Contract(contractAddress, contractAbi, signer ?? provider);
+  }, [provider, signer]);
+
+  // One-time init + wallet event listeners
+  useEffect(() => {
+    if (!provider) return;
+    let cancelled = false;
+
+    (async () => {
       try {
-        const browserProvider = new ethers.BrowserProvider(window.ethereum);
-        setProvider(browserProvider);
+        const network = await provider.getNetwork();
+        const accounts = await provider.send("eth_accounts", []);
+        if (cancelled) return;
 
-        const network = await browserProvider.getNetwork();
         setChainId(network.chainId.toString());
-
-        // Check if user is already connected
-        const accounts = await browserProvider.send("eth_accounts", []);
         if (accounts.length > 0) {
-          const activeSigner = await browserProvider.getSigner();
+          const activeSigner = await provider.getSigner();
+          if (cancelled) return;
           setAccount(accounts[0]);
           setSigner(activeSigner);
-          const contractInstance = new ethers.Contract(contractAddress, contractAbi, activeSigner);
-          setContract(contractInstance);
-        } else {
-          // Fallback to read-only contract instance
-          const readOnlyContract = new ethers.Contract(contractAddress, contractAbi, browserProvider);
-          setContract(readOnlyContract);
         }
       } catch (err) {
         console.error("Error initializing Web3 provider:", err);
       }
-    }
-  }, [contractAddress, contractAbi]);
+    })();
 
-  useEffect(() => {
-    initProvider();
-
-    if (window.ethereum) {
-      const handleAccountsChanged = async (accounts) => {
-        if (accounts.length > 0) {
+    const handleAccountsChanged = async (accounts) => {
+      if (accounts.length > 0) {
+        try {
+          const activeSigner = await provider.getSigner();
           setAccount(accounts[0]);
-          if (provider) {
-            const activeSigner = await provider.getSigner();
-            setSigner(activeSigner);
-            setContract(new ethers.Contract(contractAddress, contractAbi, activeSigner));
-          }
-        } else {
-          setAccount("");
-          setSigner(null);
-          if (provider) {
-            setContract(new ethers.Contract(contractAddress, contractAbi, provider));
-          }
+          setSigner(activeSigner);
+        } catch (err) {
+          console.error("Error switching account:", err);
         }
-      };
+      } else {
+        setAccount("");
+        setSigner(null);
+      }
+    };
 
-      const handleChainChanged = () => {
-        window.location.reload();
-      };
+    const handleChainChanged = () => {
+      window.location.reload();
+    };
 
-      window.ethereum.on("accountsChanged", handleAccountsChanged);
-      window.ethereum.on("chainChanged", handleChainChanged);
+    window.ethereum.on("accountsChanged", handleAccountsChanged);
+    window.ethereum.on("chainChanged", handleChainChanged);
 
-      return () => {
-        window.ethereum.removeListener("accountsChanged", handleAccountsChanged);
-        window.ethereum.removeListener("chainChanged", handleChainChanged);
-      };
-    }
-  }, [initProvider, provider, contractAddress, contractAbi]);
+    return () => {
+      cancelled = true;
+      window.ethereum.removeListener("accountsChanged", handleAccountsChanged);
+      window.ethereum.removeListener("chainChanged", handleChainChanged);
+    };
+  }, [provider]);
 
   // Connect MetaMask Wallet
   const connectWallet = async () => {
-    if (!window.ethereum) {
+    if (!provider) {
       setErrorMessage("MetaMask not found. Please install the MetaMask browser extension.");
       return;
     }
@@ -91,16 +92,13 @@ export function Web3Provider({ children }) {
       setIsConnecting(true);
       setErrorMessage("");
 
-      const browserProvider = new ethers.BrowserProvider(window.ethereum);
-      const accounts = await browserProvider.send("eth_requestAccounts", []);
-      const activeSigner = await browserProvider.getSigner();
-      const network = await browserProvider.getNetwork();
+      const accounts = await provider.send("eth_requestAccounts", []);
+      const activeSigner = await provider.getSigner();
+      const network = await provider.getNetwork();
 
       setAccount(accounts[0]);
-      setProvider(browserProvider);
       setSigner(activeSigner);
       setChainId(network.chainId.toString());
-      setContract(new ethers.Contract(contractAddress, contractAbi, activeSigner));
     } catch (err) {
       console.error("MetaMask connection failed:", err);
       setErrorMessage(err.message || "Failed to connect wallet.");

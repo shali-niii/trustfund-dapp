@@ -4,7 +4,7 @@ import { useWeb3 } from "../context/Web3Context";
 import { formatAddress } from "../utils/helpers";
 
 export function Navbar({ onOpenCreateModal }) {
-  const { account, chainId, isConnecting, connectWallet, switchToLocalhost } = useWeb3();
+  const { account, chainId, isConnecting, errorMessage, connectWallet, switchToLocalhost } = useWeb3();
 
   const isLocalhost = chainId === "31337";
   const isSepolia = chainId === "11155111";
@@ -83,6 +83,16 @@ export function Navbar({ onOpenCreateModal }) {
           )}
         </div>
       </div>
+
+      {/* Wallet error feedback (rejected request, MetaMask missing, wrong network, ...) */}
+      {errorMessage && (
+        <div role="alert" className="border-t border-rose-500/30 bg-rose-500/10">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-2 flex items-center gap-2 text-xs text-rose-300">
+            <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+            <span>{errorMessage}</span>
+          </div>
+        </div>
+      )}
     </header>
   );
 }
